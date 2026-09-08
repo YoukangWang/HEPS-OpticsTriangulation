@@ -1,62 +1,73 @@
-function [wCent,area,eDia,xy] = detectLaserSpotRobust(roiImage)
-    % detectLaserSpotRobust: 高级激光检测，包含背景抑制与动态ROI生成
-    % 输入:
-    %   roiImage - 单通道灰度图
+function [wCent, area, eDia, xy] = detectLaserSpotRobust(roiImage)
+% detectLaserSpotRobust: 稳健激光光斑检测，含背景抑制与亚像素质心
+% 输入: roiImage - 单通道灰度图 (double, ROI局部坐标)
+% 输出: wCent [x,y] 亚像素质心, area 面积, eDia 等效直径, xy [x1 y1 x2 y2] 新动态ROI
 
-    % Median filter to filter out the salt and pepper noise.
-    smoothedImg  = medfilt2(roiImage,[5,5]);
-    % Smoothed image with Gaussian filter
-    sigma = 5;
-    smoothedImg  = imgaussfilt(smoothedImg,sigma);
+    [H, W] = size(roiImage);
 
+    % ---- 1. 预处理 ----
+    % 轻量中值滤波去椒盐噪声
+    filtered = medfilt2(roiImage, [3, 3]);
 
-    % % ==========================================
-    % % 1. 背景抑制与二值化
-    % % ==========================================
-    % % 【推荐】方案 A: Top-Hat 滤波 (专治不均匀背景光)
-    % % 半径设为 30，意味着它会消除所有宽度大于 60 像素的平缓背景光，只保留锐利的光斑
-    % se = strel('disk', 100); 
-    % I_bg_removed = imtophat(smoothedImg, se); 
+    % Top-Hat 滤波抑制不均匀背景（保留比结构元半径小的亮特征）
+    % 半径35约为典型光斑直径的1.5~2倍，可根据实际光斑大小调整
+    se = strel('disk', 35);
+    bgRemoved = imtophat(filtered, se);
 
-    % 在干净的去背景图上执行二值化
-    bw = imbinarize(rescale(smoothedImg), 'adaptive');
+    % 轻量高斯平滑（sigma=2，比原来的5更快且不模糊光斑）
+    smoothed = imgaussfilt(bgRemoved, 2);
 
+    % ---- 2. 二值化（Otsu全局阈值，比adaptive更快更稳定）----
+    normImg = rescale(smoothed);
+    T = max(graythresh(normImg), 0.25);  % 保底阈值防低对比度误检
+    bw = normImg >= T;
+    bw = bwareaopen(bw, 20);
 
-    % 形态学去噪 (去除细小杂讯)
-    bw = bwareaopen(bw, 40); 
+    % ---- 3. 候选光斑筛选 ----
+    tabBlob = regionprops('table', bw, roiImage, ...
+        'Area', 'WeightedCentroid', 'MaxIntensity', 'Circularity', 'EquivDiameter');
 
-    % ==========================================
-    % 2. 提取参数
-    % ==========================================
-    % 注意：加权质心必须依据原图 I 计算，而不是去背景后的图，以保证能量分布最原始
-    tabBlob = regionprops('table',bw, roiImage, 'Area', 'WeightedCentroid', 'MaxIntensity','Circularity','EquivDiameter');
-    tabBlob = sortrows(tabBlob,{'MaxIntensity','Area','Circularity'},{'descend','descend','descend'});
-
-    if isempty(tabBlob) || tabBlob.Circularity(1)<0.4
-        wCent = [];
-        area=[];
-        eDia = [];
-        xy = [];
+    if isempty(tabBlob)
+        [wCent, area, eDia, xy] = deal([], [], [], []);
         return;
     end
 
-    % 提取最大连通域参数
-    wCent = tabBlob.WeightedCentroid(1,:);
-    area = tabBlob.Area(1);
-    eDia = tabBlob.EquivDiameter(1);
+    % 圆度过滤（排除线状/块状噪声）
+    tabBlob = tabBlob(tabBlob.Circularity >= 0.35, :);
+    if isempty(tabBlob)
+        [wCent, area, eDia, xy] = deal([], [], [], []);
+        return;
+    end
 
-    % ==========================================
-    % 3. 生成安全的动态 ROI
-    % ==========================================
-    
-    % 计算原始矩形的对角坐标 (四舍五入为整数索引)
-    w = 6*eDia;
-    h = 8*eDia;
-    x1 = round(wCent(1) - w/2);
-    y1 = round(wCent(2) - h/2);
-    x2 = round(x1 + w - 1);
-    y2 = round(y1 + h - 1);
+    % 综合评分：亮度×圆度，优先选真实光斑而非大面积低圆度噪声
+    [~, idx] = max(tabBlob.MaxIntensity .* tabBlob.Circularity);
 
+    area = tabBlob.Area(idx);
+    eDia = tabBlob.EquivDiameter(idx);
+    coarseCent = tabBlob.WeightedCentroid(idx, :);
 
+    % ---- 4. 亚像素质心精化（在背景抑制图上加权矩，消除背景偏置）----
+    r  = max(ceil(eDia * 1.5), 8);
+    cx = round(coarseCent(1));
+    cy = round(coarseCent(2));
+    px1 = max(1, cx - r);  px2 = min(W, cx + r);
+    py1 = max(1, cy - r);  py2 = min(H, cy + r);
+
+    patch = bgRemoved(py1:py2, px1:px2);
+    [gx, gy] = meshgrid(px1:px2, py1:py2);
+    ws = sum(patch(:));
+    if ws > 0
+        wCent = [sum(gx(:) .* patch(:)) / ws, ...
+                 sum(gy(:) .* patch(:)) / ws];
+    else
+        wCent = coarseCent;
+    end
+
+    % ---- 5. 动态 ROI（跟踪窗口，供下一帧使用）----
+    margin = 6 * eDia;
+    x1 = round(wCent(1) - margin / 2);
+    y1 = round(wCent(2) - margin / 2);
+    x2 = round(x1 + margin - 1);
+    y2 = round(y1 + margin - 1);
     xy = [x1, y1, x2, y2];
 end
