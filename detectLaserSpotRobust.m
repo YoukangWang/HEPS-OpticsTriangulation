@@ -110,7 +110,7 @@ function [wCent, area, eDia, xy] = detectLaserSpotRobust(roiImage, minROISize)
     margin = min(margin, min(H, W));
     x1 = round(wCent(1) - margin / 2);
     y1 = round(wCent(2) - margin / 2);
-    x2 = round(x1 + margin - 1);
-    y2 = round(y1 + margin - 1);
+    x2 = round(x1 + margin);
+    y2 = round(y1 + margin);
     xy = [x1, y1, x2, y2];
 end
